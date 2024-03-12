@@ -1,0 +1,1069 @@
+---
+title: "stones16s_processing"
+output: html_document
+date: "2023-10-02"
+---
+
+Submitting 16s to SRA - https://software.cqls.oregonstate.edu/tips/posts/submitting-sra-data/
+
+# *Section 1*: DADA2 Processing
+
+```{r Loading Packages, include = F}
+library(dada2)
+library(phyloseq)
+library(vegan)
+library(tidyverse)
+library(dendextend)
+library(viridis)
+library(reshape2)
+library(DECIPHER)
+```
+
+```{r}
+sessionInfo()
+```
+
+
+Overview of pipeline for DADA2 Processing of raw reads. Each MiSeq lane was processed seperately genertating count table, taxonomy and ASV fastas for each lane. Combining occuring later. 
+
+1.A - Primer trimming 
+1.B - Quality trimming and viewing 
+1.C - Error Models
+1.D - Dereplication
+1.E - Inferring ASVs
+1.F - Merging of FWD and REV
+1.G - Generating count table
+1.H - Removal of Chimeras
+1.I - Taxonomy Assignment
+1.J - Outputs of downstream analysis
+
+
+##1.A - Primer trimming  
+  
+This is in bash using cutadapt  
+
+Sed command to rename from bagnumber-738_S122_L001_R2_001.fastq.gz to bagnumber-738_R2.fastq.gz (N.B it maintains the R1 and R2 needed for the paired end reads)  
+
+```{bash Checking length of raw reads folder, include = F}
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/Fastq
+ls | wc -l
+```
+
+380 forward and reverse reads, thus 190 samples
+
+```{bash removing usless info from filenames 401, include = F}
+# sed 's/\(bagnumber-[0-9]*\)_.*\(_R.\)_...\(\.fastq\.gz\)/\1\2\3/'
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/Fastq
+SAMPLES=`ls|echo`
+
+for SAMPLES in *
+do FILES=`echo $SAMPLES | sed -r 's/^([^_]+_[^_]+)_L001_(R[12])_001/\1_\2/'`
+echo ${FILES}
+mv "${SAMPLES}" "${FILES}"
+done
+```
+
+now removing everything before so its just sxxx_R1/2.fastq.gz
+
+```{bash making a file with sample names, include = F}
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/Fastq
+ls *_R1.fastq.gz | cut -d "_" -f1,2 > /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/samples
+```
+
+```{bash installing cutadapt through conda on m1 max mac chip, include = F}
+wget "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh"
+bash Miniforge3-MacOSX-arm64.sh
+CONDA_SUBDIR=osx-64 conda create -n cutadapt_env-c bioconda  cutadapt
+```
+
+```{bash PCR primer trimming loop, include = F}
+conda activate cutadapt_env
+
+# makes the filename without R1 and R2 so can be used in loops 
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/Fastq
+SAMPLES=`ls *_R1.fastq.gz | cut -d "_" -f1,2`
+echo $SAMPLES
+
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run
+cutadapt --version
+
+for sample in Fastq/*_R1.fastq.gz; do
+  sample_name=$(basename "$sample")
+  output_prefix=${sample_name%_R1.fastq.gz}
+  cutadapt \
+  -a GTGYCAGCMGCCGCGGTAA \
+  -A GGACTACNVGGGTWTCTAAT \
+  -m 10 \
+  -o "trimmed/${output_prefix}_R1_T.fastq.gz" \
+  -p "trimmed/${output_prefix}_R2_T.fastq.gz" \
+  "$sample" "Fastq/${output_prefix}_R2.fastq.gz" \
+  >> cutadapt_primer_trimming_stats.txt 2>&1
+done
+```
+
+
+##1.B - Quality assesment, and trimming and filtering
+
+```{r Making variables, include = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run")
+list.files()
+
+samples <- scan("samples", what="character")
+
+fwd_reads <- paste0(samples, "_R1_T.fastq.gz")
+rev_reads <- paste0(samples, "_R2_T.fastq.gz")
+filt_fwd_reads <- paste0(samples, "_R1_filt.fastq.gz")
+filt_rev_reads <- paste0(samples, "_R2_filt.fastq.gz")
+```
+
+```{r Quality plots, echo=F, fig.width=15}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/trimmed")
+plotQualityProfile(fwd_reads[1:5])
+plotQualityProfile(rev_reads[1:5])
+```
+
+Got the error `Error in density.default(qscore): 'x' contains missing values` for some of the forward reads. Added in `-m 10` in `cutadapt` as per these github issues and it has seemed to fix it. 
+
+https://github.com/benjjneb/dada2/issues/1385 
+https://github.com/benjjneb/dada2/issues/1316
+
+```{r trimming and filtering of fwd and rev, include = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/trimmed")
+
+filtered_out <-
+  filterAndTrim(
+    fwd_reads,
+    filt_fwd_reads,
+    rev_reads,
+    filt_rev_reads,
+    truncLen = c(210, 140), 
+    minLen = 100,
+    rm.phix = T,
+    trimLeft = 10
+  )
+```
+
+Samples with all reads removed
+- stone29tube2ambientcca_S2_R1_filt.fastq.gz and stone29tube2ambientcca_S2_R2_filt.fastq.gz
+
+Note here with the quality profiles one sample was not produced, need to therfore regenerate the filt_fwd_reads and filt_rev_reads so it works with donwstream steps.  
+
+```{bash moving filt files to new folder, include = F}
+# cd /Users/benyoung/Dropbox/PhD/Projects/POR/NGS_data/16s/zipped_raw_Data/
+# mkdir filtered
+
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/trimmed
+mkdir ../filtered
+mv *filt.fastq.gz /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/filtered
+```
+
+Should be 378
+
+```{bash checking the number of files, echo = F}
+ls /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/filtered | wc -l
+```
+
+It is, wonderful
+
+```{bash making new sample filename link, include = F}
+cd /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/filtered
+#SAMPLES=`ls *_R1_filt_.fastq.gz | cut -f1 -d "_"`
+ls *_R1_filt.fastq.gz | cut -d "_" -f1,2 > /Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/samples_aft_filt
+```
+
+```{r Making updated variables, include = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run")
+list.files()
+
+samples <- scan("samples_aft_filt", what="character")
+
+filt_fwd_reads <- paste0(samples, "_R1_filt.fastq.gz")
+filt_rev_reads <- paste0(samples, "_R2_filt.fastq.gz")
+```
+
+Note here with the quality profiles one sample was not produced, need to therfore regenerate the filt_fwd_reads and filt_rev_reads so it works with donwstream steps. The below chunk should show 1 less filt fwd and rev than just fwd and rev. 
+
+```{r length check, include false, echo = F}
+length(filt_fwd_reads)
+length(fwd_reads)
+length(filt_rev_reads)
+length(rev_reads)
+```
+
+It does yay. 
+
+```{r re checking first ten pre and post filtering, echo = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/trimmed")
+plotQualityProfile(fwd_reads[1:5])
+plotQualityProfile(rev_reads[1:5])
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/filtered")
+plotQualityProfile(filt_fwd_reads[1:5])
+plotQualityProfile(filt_rev_reads[1:5])
+```
+
+
+##1.C - Error Models 
+
+```{r Error models of fwd and rev, include = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/filtered")
+err_fwd_reads <-
+  learnErrors(filt_fwd_reads, 
+              multithread = T, 
+              verbose = T)
+err_rev_reads <-
+  learnErrors(filt_rev_reads, 
+              multithread = T, 
+              verbose = T)
+```
+
+112705000 total bases in 563525 reads from 6 samples will be used for learning the error rates.
+Initializing error rates to maximum possible estimate.
+selfConsist step 1 ......
+   selfConsist step 2
+   selfConsist step 3
+   selfConsist step 4
+   selfConsist step 5
+   selfConsist step 6
+   selfConsist step 7
+Convergence after  7  rounds.
+
+106186470 total bases in 816819 reads from 9 samples will be used for learning the error rates.
+Initializing error rates to maximum possible estimate.
+selfConsist step 1 .........
+   selfConsist step 2
+   selfConsist step 3
+   selfConsist step 4
+   selfConsist step 5
+   selfConsist step 6
+   selfConsist step 7
+   selfConsist step 8
+Convergence after  8  rounds.
+
+```{r plotting error models, echho = F}
+plotErrors(err_fwd_reads, nominalQ = T)
+plotErrors(err_rev_reads, nominalQ = T)
+```
+
+All looks good, moving on. 
+
+
+##1.D - Dereplication  
+
+```{r dereplication, include = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/miseq_run/filtered")
+derep_fwd <- derepFastq(filt_fwd_reads, verbose = T)
+derep_rev <- derepFastq(filt_rev_reads, verbose = T)
+
+# the sample names in these objects are initially the file names of the samples, this sets them to the sample names for the rest of the workflow
+names(derep_fwd) <- samples
+names(derep_rev) <- samples
+```
+
+
+##1.E -  Inferring ASVs  
+
+```{r inferring ASVs, include = F}
+dada_fwd <-
+  dada(
+    derep_fwd,
+    err = err_fwd_reads,
+    pool = "pseudo",
+    multithread = T,
+    verbose = T
+  )
+dada_rev <-
+  dada(
+    derep_rev,
+    err = err_rev_reads,
+    pool = "pseudo",
+    multithread = T,
+    verbose = T
+  )
+```
+
+**Problem Samples** 
+fwd
+Sample 121 - 1 in 1
+Sample 132 - 1 in 1
+
+rev
+Sample 121 - 1 in 1
+Sample 132 - 1 in 1
+
+
+##1.F - Merging FWD and REV Reads
+
+```{r Merged Amplicons, include = F}
+merged_amplicons <-
+  mergePairs(
+    dada_fwd,
+    derep_fwd,
+    dada_rev,
+    derep_rev,
+    trimOverhang = T,
+    minOverlap = 90,
+    verbose = T
+  )
+```
+
+```{r Looking at Merged, include = F}
+# info if we want to look at whats been done/going on
+class(merged_amplicons)
+length(merged_amplicons) # each element is a sample
+names(merged_amplicons) # gives name of each element in the list
+
+# each element of the list is a dataframe that can be accessed and manipulated like any ordinary dataframe
+class(merged_amplicons$stone10tube175highbarestone_S175)
+
+# the names() function on a dataframe gives you the column names
+names(merged_amplicons$stone10tube175highbarestone_S175)
+```
+
+
+##1.G - Generating Count Table  
+
+```{r Count table, include =F}
+seqtab <- makeSequenceTable(merged_amplicons)
+
+class(seqtab)
+dim(seqtab)
+```
+
+
+##1.H - Removing Chimeras  
+
+```{r removing chimeras, include = F}
+seqtab_nochim <- removeBimeraDenovo(seqtab, verbose = T)
+```
+
+```{r sum check after chimera removal, include = F}
+sum(seqtab_nochim)/sum(seqtab)
+```
+
+Identified  bimeras out of  input sequences  
+2682 chimera = 0.98 (2dp)  
+Barely lost any which is good in terms of abundance
+
+
+##1.I - Assigning Taxonomy
+
+```{r Downloading SILVA reference, include = F}
+setwd("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects")
+## downloading DECIPHER-formatted SILVA v138 reference
+download.file(url="http://www2.decipher.codes/Classification/TrainingSets/SILVA_SSU_r138_2019.RData", 
+              destfile="SILVA_SSU_r138_2019.RData")
+
+## loading reference taxonomy object
+load("SILVA_SSU_r138_2019.RData")
+```
+
+```{r Taxonomic Assignment, include = F}
+dna <- DNAStringSet(getSequences(seqtab_nochim))
+
+tax_info <-
+  IdTaxa(
+    test = dna,
+    trainingSet = trainingSet,
+    strand = "both",
+    processors = NULL,
+    verbose = T
+  )
+```
+
+Time difference of 42741.03 secs
+
+##1.J - Outputs from DADA2 for Downstream Analysis
+
+```{r DADA2 goods, echo = F}
+asv_seqs <- colnames(seqtab_nochim)
+asv_headers <- vector(dim(seqtab_nochim)[2], mode = "character")
+
+for (i in 1:dim(seqtab_nochim)[2]) {
+  asv_headers[i] <- paste(">ASV", i, sep="_")
+}
+
+# making and writing out a fasta of our final ASV seqs:
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta,
+      "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/ASV_seqs.fa")
+
+# count table:
+asv_tab <- t(seqtab_nochim)
+row.names(asv_tab) <- sub(">", "", asv_headers)
+write.table(
+  asv_tab,
+  "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/ASVs_counts.tsv",
+  sep = "\t",
+  quote = F,
+  col.names = NA
+)
+
+  # tax table:
+  # creating table of taxonomy and setting any that are unclassified as "NA"
+ranks <-
+  c("domain",
+    "phylum",
+    "class",
+    "order",
+    "family",
+    "genus",
+    "species")
+asv_tax <- t(sapply(tax_info, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(asv_tax) <- ranks
+rownames(asv_tax) <-
+  gsub(pattern = ">",
+       replacement = "",
+       x = asv_headers)
+
+write.table(
+  asv_tax,
+  "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/ASVs_taxonomy.tsv",
+  sep = "\t",
+  quote = F,
+  col.names = NA
+)
+```
+
+```{r reading in dada2 outputs for megaframe generation, include = F}
+read.table("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/ASVs_counts.tsv") %>% 
+  rownames_to_column(var = "asv") -> counts
+# View(counts)
+
+read.table("/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/ASVs_taxonomy.tsv", 
+           sep = "\t", 
+           header = T) -> taxo
+# View(taxo)
+
+read.table(file = "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/ASV_seqs.fa") -> seqs
+# View(seqs)
+
+seqs %>% 
+  group_by(grp = str_c('Column', rep(1:2, length.out = n()))) %>% 
+  mutate(rn = row_number()) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = grp, values_from = V1) %>% 
+  mutate(Column1 = str_remove_all(Column1, ">"),
+         asv = Column1, 
+         Sequence = Column2) %>% 
+  dplyr::select(-rn, -Column1, -Column2) -> seqs_long
+View(seqs_long)
+```
+
+```{r making the megaframe muah ha ha ha ha haaaaaa, include = F}
+taxo %>% 
+  inner_join(counts) %>% 
+  inner_join(seqs_long) -> stones_megaframe
+```
+
+```{r}
+save(stones_megaframe, 
+     file = "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/stones_megaframe.RData")
+save(taxo, 
+     file = "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/taxo.RData")
+save(seqs_long, 
+     file = "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/seqs_long.RData")
+save(counts, 
+     file = "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/counts.RData")
+```
+
+
+# *Section 2*: Analysis Prep of Processed Raw Reads
+
+General overview of pre-processing before going into analyses. 
+
+*2.A* - Metadata Organisation
+Reading in the metadata sheets (mine and sequencing) and making sure all matches and everything looks good before moving on. 
+
+*2.B* - Removing Low Count Samples
+From literature I am seeing that samples with <xxx counts are dropped.
+
+*2.C* - Phylogenetic Tree Construction
+I generated the phylogenetic tree here so it included all ASVs identified from DADA2 (using phangorn). This is very computationally expensive and took ~2 days using the desktop MAC. 
+
+*2.D* - Removal of Mitochondria, Chloroplast, and Eukaryota ASV's
+As with all coral 16s research, removal of the ASVs annotated to mitochondria, chloroplast, and Eukaryota are removed. Thus I do that here with ones which annotated with SILVA to these, as well as using the phylogenetic tree to remove NA ASVs which cluster within the branches of the annotated Mitochondria and Chloroplast. 
+
+*2.E* - Adding Metadata Variables
+Can add some more information to the treatment file so that we have more to look at in data analysis. 
+
+*2.F* - Checking Samples and Saving All for Downstream Analysis
+After the ASV and sample filtering I just wanted to get an idea of samples on sampling dates. Nothing fancy here just an FYI.
+
+```{r package loading for Section 2, include = F}
+library(zCompositions)
+library(phyloseq)
+library(vegan)
+library(DESeq2)
+library(tidyverse)
+library(dendextend)
+library(viridis)
+library(reshape)
+library(seqRFLP) #github package
+library(phangorn)
+library(ape)
+library(dada2)
+library(DECIPHER)
+library(ggtree)
+library(compare)
+library(ALDEx2)
+library(CoDaSeq)
+library(ggdendro)
+library(factoextra)
+library(PCAtools)
+library(taxonomizr)
+library(tidyverse)
+```
+
+```{r loading the megaframe, include = F}
+load("/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/stones_megaframe.RData")
+```
+
+
+##2.A - Metadata Organisation
+
+```{r reading in different metadata files for combination, include = F}
+read.csv("/Users/benyoung//Dropbox/research/NOAA_postdoc/projects/stones_16s/files_for_analysis/metadata_16s.csv") %>% 
+  dplyr::filter(tube_number < 191) -> metadata
+# View(metadata)
+
+read.csv("/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/files_for_analysis/sequencing_metadata.csv") -> seq_metadata
+# View(seq_metadata)
+
+read.csv("/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/files_for_analysis/sequenced_samples.csv", 
+         skip = 18) -> sequenced_samples
+# View(sequenced_samples)
+```
+
+```{r making the seq_id into the metadata, include = F}
+metadata %>%
+  dplyr::select(1:10, 12, 17, 27:31) %>% 
+  mutate(Sample_ID = str_replace_all(sequencing_name, 
+                                  "_", 
+                                  ""), 
+         Sample_ID = str_replace_all(Sample_ID, 
+                                     "\\.2µ", 
+                                     "point2u")) %>%
+  inner_join(sequenced_samples) %>%
+  column_to_rownames(var = "Sample_ID") -> metadata_all
+# View(metadata_all)
+```
+
+```{r writing out for Alice, include = F}
+# write.csv(metadata_all, 
+#           file = "/Users/benjamin.d.young/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/metadata_4_alice.csv")
+```
+
+```{r}
+read.csv(file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/files_for_analysis/fluxes_24h.csv") %>% 
+  dplyr::rename(., stone_number = Idstone) %>% 
+  mutate(stone_number = as.character(stone_number)) %>% 
+  right_join(metadata_all %>% 
+               rownames_to_column(var = "seq_id")) %>%
+  column_to_rownames(var = "seq_id") -> metadata_all
+```
+
+
+##2.B - Removing Low Count Samples
+
+```{r files for removing low count samples, include = F}
+stones_megaframe %>% 
+  dplyr::select(-domain, -phylum, -class, -order, -family, -genus, -species, -Sequence) %>% 
+  column_to_rownames(var = "asv") %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "samp") %>% 
+  mutate(samp = str_replace_all(samp, 
+                                "_S\\d*",
+                                "")) %>% 
+  column_to_rownames(var = "samp") %>% 
+  t() %>% 
+  as.data.frame() -> stone_counts
+
+stones_megaframe %>% 
+  dplyr::select(asv, domain, phylum, class, order, family, genus, species) %>% 
+  column_to_rownames(var = "asv") -> stone_taxo
+
+stones_megaframe %>% 
+  dplyr::select(asv, Sequence) -> stone_sequence
+
+nrow(stone_counts)
+nrow(stone_taxo)
+nrow(stone_sequence)
+ncol(stone_counts)
+```
+
+```{r making count filtering for treatment file, echo = F}
+stone_counts %>% 
+  t() %>% 
+  rownames() -> samples
+length(samples) ## have 374 samples sequenced succesfully
+```
+
+```{r ordering treatment and count file correctly, echo = F}
+metadata_all %>% 
+  rownames_to_column(var = "samp") %>%
+  dplyr::filter(samp %in% samples) %>%
+  column_to_rownames(var = "samp") -> metadata_all
+
+matchup <- match(rownames(metadata_all), colnames(stone_counts))
+stone_counts  <- stone_counts[,matchup]
+all(rownames(metadata_all) == colnames(stone_counts))
+# View(treat_POR)
+```
+
+```{r checking all lengths are correct, echo = F}
+nrow(stone_counts)
+nrow(stone_taxo)
+nrow(stone_sequence)
+
+ncol(stone_counts)
+nrow(metadata_all)
+```
+
+- 190 samples in treatment file 
+- 189 samples successfully sequenced
+Therefore 1 library failed completely. 
+
+```{r ordering and looking at low count samples, echo = F}
+stone_counts %>%
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="samp") %>%
+  mutate(count_total = rowSums(stone_counts %>% 
+                                 t() %>% 
+                                 as.data.frame() %>% 
+                                 dplyr::select(starts_with("ASV")))) %>%
+  dplyr::select(samp, count_total) %>% 
+  column_to_rownames(var="samp") %>% 
+  arrange(count_total) -> sample_counts
+head(sample_counts)
+```
+
+From some googling
+Caporaso et al (2011) -> 2000 counts per sample needed to characterise prokayotic community (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3063599/)
+Bukin et al (2019) -> 10,00-15,000 counts (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6362892/)
+
+For this, looking at above I will use the 15k cut off. This removes 2 samples
+- stone70tube61elevatedbarestone - 0
+- stone65tube94elevatedcca - 0
+
+```{r removing samples with <15000 reads, include = F}
+stone_counts %>%
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="samp") %>%
+  mutate(count_total = rowSums(stone_counts %>% 
+                                 t() %>% 
+                                 as.data.frame() %>% 
+                                 dplyr::select(starts_with("ASV")))) %>%
+  dplyr::select(samp, count_total) %>% 
+  column_to_rownames(var="samp") %>% 
+  arrange(count_total) %>%
+  filter(count_total < 15000) %>%
+  rownames() -> lowcount_bagnums
+length(lowcount_bagnums)
+
+stone_counts %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var="samp") %>% 
+  filter(!samp %in% lowcount_bagnums) %>% 
+  column_to_rownames(var="samp") %>% 
+  t() %>% 
+  as.data.frame() -> stone_counts_filt
+
+ncol(stone_counts)
+ncol(stone_counts_filt)
+```
+
+Input for this was *189* samples
+Filtering out <15,000 leaves with *187* (matches yay, 2 samples removed)
+
+```{r match up to treatment and taxo after filtering, echo = T}
+stone_counts_filt %>% 
+  t() %>%
+  rownames() -> samps
+
+stone_counts_filt %>% 
+  rownames() -> ASVs
+
+metadata_all %>% 
+  rownames_to_column(var="Samp") %>%
+  filter(Samp %in% samps) %>% 
+  column_to_rownames(var = "Samp") -> metadata_all_filt
+
+matchup <- match(rownames(metadata_all_filt), colnames(stone_counts_filt))
+stone_counts_filt  <- stone_counts_filt[,matchup]
+all(rownames(metadata_all_filt) == colnames(stone_counts_filt))
+
+stone_taxo %>% 
+  rownames_to_column(var="ASV_number") %>% 
+  filter(ASV_number %in% ASVs) %>% 
+  column_to_rownames(var="ASV_number") -> stone_taxo_filt
+
+all(rownames(stone_taxo_filt) == rownames(stone_counts_filt))
+```
+
+```{r checking eveything makes sense, echo = F}
+nrow(stone_taxo_filt)
+nrow(stone_counts_filt)
+ncol(stone_counts_filt)
+nrow(metadata_all_filt)
+nrow(stone_sequence)
+```
+
+```{r Checking ASV match, echo = F}
+all(stone_sequence$ASV_number == rownames(stone_counts_filt))
+all(stone_sequence$ASV_number == rownames(stone_taxo_filt))
+all(rownames(stone_taxo_filt) == rownames(stone_counts_filt))
+```
+
+Taxo, treatment and counts now all match each other woooooooooooo
+ASVs = 35536
+Samples = 187
+
+Name of files going forward 
+Count = stone_counts_filt
+Taxonomy = stone_taxo_filt
+Treatment = metadata_all_filt
+Sequences = stone_sequence
+
+
+##2.C - Phylogenetic Tree Construction
+
+```{r}
+library(dada2)
+library(seqRFLP)
+library(tidyverse)
+```
+
+```{r}
+load(file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/taxo.RData")
+load(file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/pre_processing_files/seqs_long.RData")
+```
+
+```{r making the seq file and the tip labels, include = F}
+# ASV_filt <- dataframe2fas(seqs_long %>% 
+#                             as.data.frame() %>%
+#                             select(asv, Sequence),
+#                           file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/files_for_analysis/seq.fasta")
+# 
+# taxo %>%
+#   rownames_to_column(var = "tip.label") %>% 
+#   dplyr::select(-tip.label) %>% View()
+#   write.table(
+#     .,
+#     file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/files_for_analysis/stone_taxo_tiplabels",
+#     quote = F,
+#     row.names = F,
+#     sep = "\t"
+#   )
+```
+
+Upload the `seq.fasta` to the supercomputer. 
+
+```{bash}
+# mamba create -n phangorn_env -c bioconda r-phangorn
+# mamba activate phangorn_env
+# mamba install -c bioconda bioconductor-decipher
+# mamba install -c bioconda bioconductor-dada2
+# mamba activate phangorn_env
+# R
+
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("decipher")
+```
+
+```{bash}
+#!/bin/bash
+#SBATCH --time=24:00:00
+#SBATCH --partition=amilan
+#SBATCH --account=ucb423_asc1
+#SBATCH --nodes=1
+#SBATCH --ntasks=10
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=20000
+#SBATCH --job-name=stones_phylo_tree
+#SBATCH --error=/rc_scratch/beyo2625/sunbeam/scripts/stone_phylo.err
+#SBATCH --output=/rc_scratch/beyo2625/sunbeam/scripts/stone_phylo.out
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=beyo2625@colorado.edu
+
+## purging and activating conda envvironment
+# module purge
+# eval "$(conda shell.bash hook)"
+# conda activate phangorn_env
+
+# cd /scratch/alpine/beyo2625/stones_16s/phylo_tree
+
+# export TMP=/rc_scratch/$USER
+
+# R CMD BATCH Rcode.R
+```
+
+```{r}
+# library(DECIPHER)
+# library(phangorn)
+# library(dada2)
+
+# stone_seq <- getSequences(object = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/seq.fasta")
+# align <- AlignSeqs(DNAStringSet(stone_seq), 
+                   anchor = NA)
+
+# phang.align <- phyDat(as(align, 
+                         "matrix"), 
+                      type="DNA")
+
+# dm <- dist.ml(phang.align)
+# treeNJ <- NJ(dm)
+
+# save(phang.align, file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/stone_phangalign.RData")
+# save(dm, file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/stone_dist.ml_phang.RData")
+# save(treeNJ, file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/stone_treeNJ.RData")
+# save(align, file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/stone_alignedseqs.RData")
+
+# fit = pml(treeNJ, data = phang.align)
+# fitGTR <- update(fit, k = 4, inv = 0.2)
+# fitGTR <-
+#   optim.pml(
+#     fitGTR,
+#     model = "GTR",
+#     optInv = TRUE,
+#     optGamma = TRUE,
+#     rearrangement = "stochastic",
+#     control = pml.control(trace = 0)
+#   )
+  
+# save(fitGTR, 
+     file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/fitGTR.RData")
+     
+# write.tree(treeNJ, 
+           file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/stone_NJ_tree")
+# write.tree(fitGTR$tree, 
+           file = "/scratch/alpine/beyo2625/stones_16s/phylo_tree/stone_fitgtr_tree")
+```
+
+```{r}
+load("/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/phylo_tree/stone_treeNJ.RData")
+write.tree(treeNJ, 
+           file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_generated_files/phylo_tree/stone_NJ_tree")
+```
+
+```{r Quick Plot to look at trees, include = F}
+# ggtree(treeNJ, layout = "slanted") + geom_tiplab()
+```
+
+This is taking a while so decided to also do a RAxML tree
+
+https://www.biostars.org/p/318587/
+https://groups.google.com/g/raxml/c/zROo87_WdQY 
+
+```{bash}
+#!/bin/bash
+#SBATCH --time=168:00:00
+#SBATCH --partition=amilan
+#SBATCH --qos=long
+#SBATCH --account=ucb423_asc1
+#SBATCH --nodes=1
+#SBATCH --ntasks=2
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=20000
+#SBATCH --job-name=raxml_d
+#SBATCH --error=/scratch/alpine/beyo2625/stones_16s/raxml_tree/raxml_d.err
+#SBATCH --output=/scratch/alpine/beyo2625/stones_16s/raxml_tree/raxml_d.out
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=beyo2625@colorado.edu
+
+# module purge
+# eval "$(conda shell.bash hook)"
+# conda activate raxml_env
+
+# cd /scratch/alpine/beyo2625/stones_16s/raxml_tree
+
+# raxmlHPC \
+# -f a \
+# -T 4 \
+# -x 20 \
+# -m GTRCAT \
+# -p 20 \
+# -s seq_align.fasta \
+# -n MLTrees \
+# -# 50
+```
+
+```{r loading the bootstrap tree}
+# library(treedata.table)
+# read.tree(file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/raxml_tree/RAxML_bootstrap.MLTrees") -> allgenetrees
+```
+
+```{r densitree of bootstrap tree, fig.width = 15}
+# ggdensitree(
+#   allgenetrees,
+#   alpha = .2,
+#   colour = 'steelblue',
+#   align.tips = T, 
+#   branch.length = "none"
+# )
+#   geom_tiplab(size = 3) +
+#   hexpand(.35)
+```
+
+
+##2.D - Removal of Mitochondria, Chloroplast, and Eukaryota ASV's
+###2.D.1 - Just annotated and ones with no annotation at all
+
+```{r Objects to work with, echo = F}
+all(stone_sequence$asv == rownames(stone_counts_filt))
+all(stone_sequence$asv == rownames(stone_taxo_filt))
+all(rownames(stone_taxo_filt) == rownames(stone_counts_filt))
+all(colnames(stone_counts_filt) == rownames(metadata_all_filt))
+```
+
+Everything is matching up which is wonderful. File names to work with are the ones above. 
+
+```{r making filtering object of ASVs which annotated to Chloro Mito and Euk during SILVA stage, echo = F}
+stone_taxo_filt %>%
+  dplyr::filter_all(any_vars(str_detect(., "Mitochondri|Chloroplas|Euk"))) %>%
+  rownames() -> mc_filter
+length(mc_filter)
+```
+
+*171* annotated sequences to chloro, mito and Euk from SILVA annotation. 
+
+```{r}
+stone_taxo_filt %>% 
+  rownames_to_column(var = "asv") %>% 
+  dplyr::filter(!asv %in% mc_filter) %>%
+  column_to_rownames(var = "asv") %>% 
+  drop_na(domain) -> stone_taxo_filt_v2
+```
+
+
+###2.D.2 - Phylo tree clustered ones
+
+```{r reading in text files with NA ASVs which fall in chloro mito and euk in generated tree, include = F}
+# read.delim(file = "/Users/benjamin.d.young/Dropbox/NOAA_postdoc/projects/POR_master/analysis/prokaryotic/spreadsheets_for_analysis/chloro_filt.txt", header = F) %>%
+#   as.data.frame() %>%
+#   filter(V1 %in% combined_POR$ASV_number) -> chloro_filt
+# 
+# read.delim(file = "/Users/benjamin.d.young/Dropbox/NOAA_postdoc/projects/POR_master/analysis/prokaryotic/spreadsheets_for_analysis/mito_filt.txt", header = F) %>%
+#   as.data.frame() %>%
+#   filter(V1 %in% combined_POR$ASV_number) -> mito_filt
+# 
+# read.delim(file = "/Users/benjamin.d.young/Dropbox/NOAA_postdoc/projects/POR_master/analysis/prokaryotic/spreadsheets_for_analysis/euk_filt.txt", header = F) %>%
+#   as.data.frame() %>%
+#   filter(V1 %in% combined_POR$ASV_number) -> euk_filt
+```
+
+```{r length of the filters, echo = F}
+# nrow(chloro_filt)
+# nrow(mito_filt)
+# nrow(euk_filt)
+# View(chloro_filt)
+# View(mito_filt)
+# View(euk_filt)
+```
+
+From the phylo tree
+*xxx* chloroplast
+*xxx* mitochondrial
+*xxx* euks
+
+```{r filtering tree inferred sequences and SILVA annotated sequences, include = F}
+# POR_taxo_filt_before <- POR_taxo_filt
+# 
+# POR_taxo_filt %>%
+#   rownames_to_column(var = "ASV_number") %>%
+#   dplyr::filter(!ASV_number %in% chloro_filt$V1) %>%  # 713, there is 1 ASV missing. 29,599 rows
+#   dplyr::filter(!ASV_number %in% mito_filt$V1) %>% # 1208, there are 4 ASVs missing. 28,392 rows
+#   dplyr::filter(!ASV_number %in% euk_filt$V1) %>% # 3, there are none missing. 28,389 rows
+#   dplyr::filter(!ASV_number %in% mc_filter) -> POR_taxo_filt  # 887, there are none missing. 27,534 rows
+# 
+# nrow(POR_taxo_filt)
+# nrow(POR_taxo_filt_before)
+# nrow(POR_taxo_filt_before) - nrow(POR_taxo_filt)
+```
+
+*2778* ASVs removed using SILVA and the phylogenetic tree :). 
+
+Adding removed gives original number of ASVs, yay
+
+```{r checking length after chloro mito removal, include = F}
+# nrow(combined_POR)
+# nrow(POR_taxo)
+# nrow(POR_taxo_filt)
+```
+
+combined_DHE has *30,312 ASVs*. 
+after mito and chloro removal the DHE_taxo has *27,534 ASVs*
+
+
+### 2.D.3 - Bringing all together
+
+```{r making a combined filtered with counts, taxo, and sequences, include = F}
+stone_taxo_filt_v2 %>%
+  rownames_to_column(var = "asv") %>%
+  inner_join(stone_counts_filt %>% 
+               rownames_to_column(var = "asv")) %>% 
+  inner_join(stone_sequence) -> stone_comb_clean
+
+# nrow(stone_comb_clean)
+# ncol(stone_comb_clean)
+# View(stone_comb_clean)
+```
+
+```{r files for analysis, include = F}
+stone_comb_clean %>% 
+  dplyr::select(-domain, -phylum, -class, -order, -family, -genus, -species, -Sequence) %>% 
+  column_to_rownames(var = "asv") %>% 
+  as.data.frame() -> stone_count_4_analysis
+
+stone_comb_clean %>% 
+  dplyr::select(asv, domain, phylum, class, order, family, genus, species) %>% 
+  column_to_rownames(var = "asv") -> stone_taxo_4_analysis
+
+stone_comb_clean %>% 
+  dplyr::select(asv, Sequence) -> stone_sequence_4_analysis
+
+metadata_all_filt -> stone_treat_4_analysis
+```
+
+```{r checking all the lengths, echo = F}
+nrow(stone_count_4_analysis)
+nrow(stone_taxo_4_analysis)
+nrow(stone_sequence_4_analysis)
+
+ncol(stone_comb_clean)
+ncol(stone_count_4_analysis)
+nrow(stone_treat_4_analysis)
+```
+
+
+##2.F - Checking Samples and Saving All for Downstream Analysis
+
+```{r Checking ASV match, echo = T}
+all(stone_sequence_4_analysis$asv == rownames(stone_count_4_analysis))
+all(stone_sequence_4_analysis$asv == rownames(stone_taxo_4_analysis))
+all(rownames(stone_taxo_4_analysis) == rownames(stone_count_4_analysis))
+all(rownames(stone_treat_4_analysis) == colnames(stone_count_4_analysis))
+```
+```{r saving cleaned up files, include = F}
+save(stone_comb_clean, 
+     file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/analysis_ready_files/stone_comb_clean.RData")
+save(stone_count_4_analysis, 
+     file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/analysis_ready_files/stone_count_4_analysis.RData")
+save(stone_taxo_4_analysis, 
+     file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/analysis_ready_files/stone_taxo_4_analysis.RData")
+save(stone_sequence_4_analysis, 
+     file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/analysis_ready_files/stone_sequence_4_analysis.RData")
+save(stone_treat_4_analysis, 
+     file = "/Users/benyoung/Dropbox/research/NOAA_postdoc/projects/stones_16s/r_objects/analysis_ready_files/stone_treat_4_analysis.RData")
+```
+
